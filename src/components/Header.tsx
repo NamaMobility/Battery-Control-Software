@@ -17,7 +17,7 @@ export default function Header({ batteryData }: HeaderProps) {
               className="h-12"
             />
             <div>
-              <h1 className="text-3xl font-bold text-gray-900">Batarya Yönetim Sistemi</h1>
+              <h1 className="text-3xl font-bold text-gray-900">Batarya Yönetim Sistemi999</h1>
               <p className="text-gray-600 text-sm">Nama Mobility BMS Control Panel</p>
             </div>
           </div>

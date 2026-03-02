@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <Update.h>
 #include <ESPAsyncWebServer.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
@@ -11,6 +12,26 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+
+#if __has_include("ota_secrets.h")
+#include "ota_secrets.h"
+#endif
+
+#ifndef OTA_GITHUB_TOKEN
+#define OTA_GITHUB_TOKEN ""
+#endif
+
+#ifndef OTA_GITHUB_OWNER
+#define OTA_GITHUB_OWNER "NamaMobility"
+#endif
+
+#ifndef OTA_GITHUB_REPO
+#define OTA_GITHUB_REPO "Battery-Control-Software"
+#endif
+
+#ifndef OTA_FW_ASSET_NAME
+#define OTA_FW_ASSET_NAME "firmware.bin"
+#endif
 
 // Pin Definitions (Spec)
 constexpr uint8_t BUTTON_PIN = 19;          // D19: Ledli buton (input)
@@ -143,6 +164,8 @@ bool ledOutputState = false;
 
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
+constexpr unsigned long OTA_CHECK_INTERVAL_MS = 600000;
+constexpr char FW_VERSION[] = "1.0.0";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -191,6 +214,11 @@ void pushTelemetryToCrm();
 void pollCommandsFromCrm();
 void processCrmCommands();
 void crmTask(void *param);
+String normalizeVersionTag(const String &versionTag);
+int compareVersionStrings(const String &a, const String &b);
+void addGitHubAuthHeaders(HTTPClient &http);
+bool downloadAndApplyOtaFromAssetApi(const String &assetApiUrl, const String &targetVersion);
+void checkForOtaUpdate();
 
 String faultMessage;
 
@@ -1496,9 +1524,176 @@ void processCrmCommands() {
   }
 }
 
+String normalizeVersionTag(const String &versionTag) {
+  String normalized = versionTag;
+  normalized.trim();
+  while (normalized.startsWith("v") || normalized.startsWith("V")) {
+    normalized.remove(0, 1);
+  }
+  return normalized;
+}
+
+int compareVersionStrings(const String &a, const String &b) {
+  int a1 = 0, a2 = 0, a3 = 0;
+  int b1 = 0, b2 = 0, b3 = 0;
+  sscanf(a.c_str(), "%d.%d.%d", &a1, &a2, &a3);
+  sscanf(b.c_str(), "%d.%d.%d", &b1, &b2, &b3);
+
+  if (a1 != b1) return (a1 > b1) ? 1 : -1;
+  if (a2 != b2) return (a2 > b2) ? 1 : -1;
+  if (a3 != b3) return (a3 > b3) ? 1 : -1;
+  return 0;
+}
+
+void addGitHubAuthHeaders(HTTPClient &http) {
+  http.addHeader("Authorization", String("Bearer ") + OTA_GITHUB_TOKEN);
+  http.addHeader("User-Agent", "Nama-BMS-ESP32");
+  http.addHeader("Accept", "application/vnd.github+json");
+}
+
+bool downloadAndApplyOtaFromAssetApi(const String &assetApiUrl, const String &targetVersion) {
+  HTTPClient http;
+  WiFiClientSecure *secClient = new WiFiClientSecure;
+  if (!secClient) {
+    Serial.println("OTA: no memory for secure client");
+    return false;
+  }
+
+  secClient->setInsecure();
+  secClient->setHandshakeTimeout(30);
+  http.begin(*secClient, assetApiUrl);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setRedirectLimit(5);
+  http.setTimeout(30000);
+  http.addHeader("Authorization", String("Bearer ") + OTA_GITHUB_TOKEN);
+  http.addHeader("User-Agent", "Nama-BMS-ESP32");
+  http.addHeader("Accept", "application/octet-stream");
+
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    Serial.printf("OTA: firmware download HTTP %d\n", httpCode);
+    http.end();
+    delete secClient;
+    return false;
+  }
+
+  int contentLength = http.getSize();
+  if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN)) {
+    Serial.printf("OTA: Update.begin failed (%s)\n", Update.errorString());
+    http.end();
+    delete secClient;
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+  if (written == 0) {
+    Serial.printf("OTA: write failed (%s)\n", Update.errorString());
+    Update.abort();
+    http.end();
+    delete secClient;
+    return false;
+  }
+
+  if (!Update.end()) {
+    Serial.printf("OTA: finalize failed (%s)\n", Update.errorString());
+    http.end();
+    delete secClient;
+    return false;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("OTA: not finished");
+    http.end();
+    delete secClient;
+    return false;
+  }
+
+  http.end();
+  delete secClient;
+
+  Serial.printf("OTA: update applied to %s, restarting...\n", targetVersion.c_str());
+  delay(1000);
+  ESP.restart();
+  return true;
+}
+
+void checkForOtaUpdate() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (strlen(OTA_GITHUB_TOKEN) == 0) return;
+
+  String manifestUrl = String("https://api.github.com/repos/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO + "/releases/latest";
+
+  HTTPClient http;
+  WiFiClientSecure *secClient = new WiFiClientSecure;
+  if (!secClient) return;
+
+  secClient->setInsecure();
+  secClient->setHandshakeTimeout(30);
+  http.begin(*secClient, manifestUrl);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setRedirectLimit(5);
+  http.setTimeout(8000);
+  addGitHubAuthHeaders(http);
+
+  int httpCode = http.GET();
+  if (httpCode != 200) {
+    if (httpCode > 0) {
+      Serial.printf("OTA: manifest HTTP %d\n", httpCode);
+    } else {
+      Serial.printf("OTA: manifest fail %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+    delete secClient;
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+  delete secClient;
+
+  DynamicJsonDocument doc(6144);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) {
+    Serial.println("OTA: manifest parse error");
+    return;
+  }
+
+  String tag = doc["tag_name"] | "";
+  String targetVersion = normalizeVersionTag(tag);
+  String currentVersion = normalizeVersionTag(String(FW_VERSION));
+
+  if (targetVersion.length() == 0) {
+    Serial.println("OTA: release tag missing");
+    return;
+  }
+
+  if (compareVersionStrings(targetVersion, currentVersion) <= 0) {
+    return;
+  }
+
+  JsonArray assets = doc["assets"].as<JsonArray>();
+  String assetApiUrl;
+  for (JsonObject asset : assets) {
+    String name = asset["name"] | "";
+    if (name == OTA_FW_ASSET_NAME) {
+      assetApiUrl = asset["url"] | "";
+      break;
+    }
+  }
+
+  if (assetApiUrl.length() == 0) {
+    Serial.printf("OTA: asset not found (%s)\n", OTA_FW_ASSET_NAME);
+    return;
+  }
+
+  Serial.printf("OTA: new version %s -> %s\n", currentVersion.c_str(), targetVersion.c_str());
+  downloadAndApplyOtaFromAssetApi(assetApiUrl, targetVersion);
+}
+
 void crmTask(void *param) {
   unsigned long lastPush = 0;
   unsigned long lastPoll = 0;
+  unsigned long lastOtaCheck = 0;
   bool ready = false;
 
   for (;;) {
@@ -1514,6 +1709,7 @@ void crmTask(void *param) {
     if (!ready) {
       ready = true;
       lastPush = now - CRM_PUSH_INTERVAL_MS;
+      lastOtaCheck = now - OTA_CHECK_INTERVAL_MS;
       Serial.printf("CRM ready (Core %d). Heap: %u, DNS: %s\n",
         xPortGetCoreID(), ESP.getFreeHeap(), WiFi.dnsIP().toString().c_str());
     }
@@ -1526,6 +1722,11 @@ void crmTask(void *param) {
     if (now - lastPush >= CRM_PUSH_INTERVAL_MS) {
       lastPush = now;
       pushTelemetryToCrm();
+    }
+
+    if (now - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
+      lastOtaCheck = now;
+      checkForOtaUpdate();
     }
   }
 }
