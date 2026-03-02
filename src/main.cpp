@@ -1594,7 +1594,7 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
   http.setTimeout(30000);
   http.addHeader("Authorization", String("Bearer ") + otaToken);
   http.addHeader("User-Agent", "Nama-BMS-ESP32");
-  http.addHeader("Accept", "application/octet-stream");
+  http.addHeader("Accept", "application/vnd.github.raw");
 
   Serial.printf("OTA: %s download started\n", assetLabel.c_str());
 
@@ -1607,8 +1607,17 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
   }
 
   int contentLength = http.getSize();
+  bool spiffsUnmounted = false;
+  if (updateCommand == U_SPIFFS) {
+    SPIFFS.end();
+    spiffsUnmounted = true;
+  }
+
   if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN, updateCommand)) {
     Serial.printf("OTA: Update.begin failed (%s)\n", Update.errorString());
+    if (spiffsUnmounted) {
+      SPIFFS.begin(true);
+    }
     http.end();
     delete secClient;
     return false;
@@ -1619,6 +1628,9 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
   if (written == 0) {
     Serial.printf("OTA: write failed (%s)\n", Update.errorString());
     Update.abort();
+    if (spiffsUnmounted) {
+      SPIFFS.begin(true);
+    }
     http.end();
     delete secClient;
     return false;
@@ -1626,6 +1638,9 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
 
   if (!Update.end()) {
     Serial.printf("OTA: finalize failed (%s)\n", Update.errorString());
+    if (spiffsUnmounted) {
+      SPIFFS.begin(true);
+    }
     http.end();
     delete secClient;
     return false;
@@ -1633,6 +1648,9 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
 
   if (!Update.isFinished()) {
     Serial.println("OTA: not finished");
+    if (spiffsUnmounted) {
+      SPIFFS.begin(true);
+    }
     http.end();
     delete secClient;
     return false;
@@ -1729,7 +1747,6 @@ void checkForOtaUpdate() {
   bool spiffsUpdated = false;
   if (spiffsAssetApiUrl.length() > 0) {
     Serial.println("OTA: SPIFFS update detected");
-    SPIFFS.end();
     spiffsUpdated = downloadAndApplyOtaAsset(spiffsAssetApiUrl, U_SPIFFS, "SPIFFS", false);
     if (!spiffsUpdated) {
       Serial.println("OTA: SPIFFS update failed");
