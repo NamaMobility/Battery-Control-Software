@@ -33,6 +33,10 @@
 #define OTA_FW_ASSET_NAME "firmware.bin"
 #endif
 
+#ifndef OTA_SPIFFS_ASSET_NAME
+#define OTA_SPIFFS_ASSET_NAME "spiffs.bin"
+#endif
+
 // Pin Definitions (Spec)
 constexpr uint8_t BUTTON_PIN = 19;          // D19: Ledli buton (input)
 constexpr uint8_t EMERGENCY_STOP_PIN = 18;  // D18: Acil stop (input)
@@ -165,7 +169,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 600000;
-constexpr char FW_VERSION[] = "1.0.0";
+constexpr char FW_VERSION[] = "1.0.2";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -217,7 +221,7 @@ void crmTask(void *param);
 String normalizeVersionTag(const String &versionTag);
 int compareVersionStrings(const String &a, const String &b);
 void addGitHubAuthHeaders(HTTPClient &http);
-bool downloadAndApplyOtaFromAssetApi(const String &assetApiUrl, const String &targetVersion);
+bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, const String &assetLabel, bool restartAfter);
 void checkForOtaUpdate();
 
 String faultMessage;
@@ -1551,7 +1555,7 @@ void addGitHubAuthHeaders(HTTPClient &http) {
   http.addHeader("Accept", "application/vnd.github+json");
 }
 
-bool downloadAndApplyOtaFromAssetApi(const String &assetApiUrl, const String &targetVersion) {
+bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, const String &assetLabel, bool restartAfter) {
   HTTPClient http;
   WiFiClientSecure *secClient = new WiFiClientSecure;
   if (!secClient) {
@@ -1569,16 +1573,18 @@ bool downloadAndApplyOtaFromAssetApi(const String &assetApiUrl, const String &ta
   http.addHeader("User-Agent", "Nama-BMS-ESP32");
   http.addHeader("Accept", "application/octet-stream");
 
+  Serial.printf("OTA: %s download started\n", assetLabel.c_str());
+
   int httpCode = http.GET();
   if (httpCode != 200) {
-    Serial.printf("OTA: firmware download HTTP %d\n", httpCode);
+    Serial.printf("OTA: %s download HTTP %d\n", assetLabel.c_str(), httpCode);
     http.end();
     delete secClient;
     return false;
   }
 
   int contentLength = http.getSize();
-  if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN)) {
+  if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN, updateCommand)) {
     Serial.printf("OTA: Update.begin failed (%s)\n", Update.errorString());
     http.end();
     delete secClient;
@@ -1612,9 +1618,14 @@ bool downloadAndApplyOtaFromAssetApi(const String &assetApiUrl, const String &ta
   http.end();
   delete secClient;
 
-  Serial.printf("OTA: update applied to %s, restarting...\n", targetVersion.c_str());
-  delay(1000);
-  ESP.restart();
+  Serial.printf("OTA: %s update applied successfully\n", assetLabel.c_str());
+
+  if (restartAfter) {
+    Serial.println("OTA: restart requested, rebooting now...");
+    delay(1000);
+    ESP.restart();
+  }
+
   return true;
 }
 
@@ -1672,22 +1683,49 @@ void checkForOtaUpdate() {
   }
 
   JsonArray assets = doc["assets"].as<JsonArray>();
-  String assetApiUrl;
+  String fwAssetApiUrl;
+  String spiffsAssetApiUrl;
+
   for (JsonObject asset : assets) {
     String name = asset["name"] | "";
     if (name == OTA_FW_ASSET_NAME) {
-      assetApiUrl = asset["url"] | "";
-      break;
+      fwAssetApiUrl = asset["url"] | "";
+    } else if (name == OTA_SPIFFS_ASSET_NAME) {
+      spiffsAssetApiUrl = asset["url"] | "";
     }
   }
 
-  if (assetApiUrl.length() == 0) {
-    Serial.printf("OTA: asset not found (%s)\n", OTA_FW_ASSET_NAME);
+  if (fwAssetApiUrl.length() == 0 && spiffsAssetApiUrl.length() == 0) {
+    Serial.printf("OTA: asset not found (%s / %s)\n", OTA_FW_ASSET_NAME, OTA_SPIFFS_ASSET_NAME);
     return;
   }
 
-  Serial.printf("OTA: new version %s -> %s\n", currentVersion.c_str(), targetVersion.c_str());
-  downloadAndApplyOtaFromAssetApi(assetApiUrl, targetVersion);
+  Serial.printf("OTA: update available %s -> %s\n", currentVersion.c_str(), targetVersion.c_str());
+
+  bool spiffsUpdated = false;
+  if (spiffsAssetApiUrl.length() > 0) {
+    Serial.println("OTA: SPIFFS update detected");
+    SPIFFS.end();
+    spiffsUpdated = downloadAndApplyOtaAsset(spiffsAssetApiUrl, U_SPIFFS, "SPIFFS", false);
+    if (!spiffsUpdated) {
+      Serial.println("OTA: SPIFFS update failed");
+      return;
+    }
+  }
+
+  if (fwAssetApiUrl.length() > 0) {
+    Serial.println("OTA: Firmware update detected");
+    if (!downloadAndApplyOtaAsset(fwAssetApiUrl, U_FLASH, "Firmware", true)) {
+      Serial.println("OTA: Firmware update failed");
+    }
+    return;
+  }
+
+  if (spiffsUpdated) {
+    Serial.println("OTA: only SPIFFS updated, rebooting to remount FS...");
+    delay(1000);
+    ESP.restart();
+  }
 }
 
 void crmTask(void *param) {
