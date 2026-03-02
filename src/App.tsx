@@ -121,8 +121,11 @@ function App() {
         <ServiceModal onClose={() => setShowServiceModal(false)} />
       )}
 
-      <footer className="py-4 text-center text-sm text-blue-100/90">
-        nama mobility 2026. v1.151
+      <footer className="py-4 text-center text-sm text-blue-900">
+        <div className="inline-flex max-w-[95%] flex-col items-center rounded-md bg-white px-3 py-2 text-xs leading-relaxed sm:px-4 sm:text-sm">
+          <span className="font-medium">Nama Mobility 2026. V1.151</span>
+          <span className="break-words">https://www.namamobility.com | Hakları Nama Mobility'e Aittir.</span>
+        </div>
       </footer>
     </div>
   );
