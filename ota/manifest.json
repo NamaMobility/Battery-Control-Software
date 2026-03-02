@@ -1,6 +1,6 @@
 {
     "version":  "1.0.3",
     "force":  false,
-    "firmwareApiUrl":  "https://api.github.com/repos/NamaMobility/Battery-Control-Software/contents/ota/firmware.bin?ref=main",
-    "spiffsApiUrl":  "https://api.github.com/repos/NamaMobility/Battery-Control-Software/contents/ota/spiffs.bin?ref=main"
+    "firmwareApiUrl": "https://raw.githubusercontent.com/NamaMobility/Battery-Control-Software/main/ota/firmware.bin",
+    "spiffsApiUrl": "https://raw.githubusercontent.com/NamaMobility/Battery-Control-Software/main/ota/spiffs.bin"
 }
