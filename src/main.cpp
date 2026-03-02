@@ -21,6 +21,14 @@
 #define OTA_GITHUB_TOKEN ""
 #endif
 
+#ifndef OTA_GITHUB_TOKEN_PART1
+#define OTA_GITHUB_TOKEN_PART1 ""
+#endif
+
+#ifndef OTA_GITHUB_TOKEN_PART2
+#define OTA_GITHUB_TOKEN_PART2 ""
+#endif
+
 #ifndef OTA_GITHUB_OWNER
 #define OTA_GITHUB_OWNER "NamaMobility"
 #endif
@@ -35,6 +43,10 @@
 
 #ifndef OTA_SPIFFS_ASSET_NAME
 #define OTA_SPIFFS_ASSET_NAME "spiffs.bin"
+#endif
+
+#ifndef OTA_MANIFEST_PATH
+#define OTA_MANIFEST_PATH "ota/manifest.json"
 #endif
 
 // Pin Definitions (Spec)
@@ -169,7 +181,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 600000;
-constexpr char FW_VERSION[] = "1.0.2";
+constexpr char FW_VERSION[] = "1.0.3";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -220,7 +232,7 @@ void processCrmCommands();
 void crmTask(void *param);
 String normalizeVersionTag(const String &versionTag);
 int compareVersionStrings(const String &a, const String &b);
-void addGitHubAuthHeaders(HTTPClient &http);
+String getOtaGithubToken();
 bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, const String &assetLabel, bool restartAfter);
 void checkForOtaUpdate();
 
@@ -1549,13 +1561,24 @@ int compareVersionStrings(const String &a, const String &b) {
   return 0;
 }
 
-void addGitHubAuthHeaders(HTTPClient &http) {
-  http.addHeader("Authorization", String("Bearer ") + OTA_GITHUB_TOKEN);
-  http.addHeader("User-Agent", "Nama-BMS-ESP32");
-  http.addHeader("Accept", "application/vnd.github+json");
+String getOtaGithubToken() {
+  String token = String(OTA_GITHUB_TOKEN);
+  if (token.length() > 0) {
+    return token;
+  }
+
+  token = String(OTA_GITHUB_TOKEN_PART1);
+  token += OTA_GITHUB_TOKEN_PART2;
+  return token;
 }
 
 bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, const String &assetLabel, bool restartAfter) {
+  String otaToken = getOtaGithubToken();
+  if (otaToken.length() == 0) {
+    Serial.println("OTA: GitHub token is empty");
+    return false;
+  }
+
   HTTPClient http;
   WiFiClientSecure *secClient = new WiFiClientSecure;
   if (!secClient) {
@@ -1569,7 +1592,7 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setRedirectLimit(5);
   http.setTimeout(30000);
-  http.addHeader("Authorization", String("Bearer ") + OTA_GITHUB_TOKEN);
+  http.addHeader("Authorization", String("Bearer ") + otaToken);
   http.addHeader("User-Agent", "Nama-BMS-ESP32");
   http.addHeader("Accept", "application/octet-stream");
 
@@ -1631,9 +1654,10 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
 
 void checkForOtaUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (strlen(OTA_GITHUB_TOKEN) == 0) return;
+  String otaToken = getOtaGithubToken();
+  if (otaToken.length() == 0) return;
 
-  String manifestUrl = String("https://api.github.com/repos/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO + "/releases/latest";
+  String manifestUrl = String("https://api.github.com/repos/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO + "/contents/" + OTA_MANIFEST_PATH + "?ref=main";
 
   HTTPClient http;
   WiFiClientSecure *secClient = new WiFiClientSecure;
@@ -1645,7 +1669,9 @@ void checkForOtaUpdate() {
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setRedirectLimit(5);
   http.setTimeout(8000);
-  addGitHubAuthHeaders(http);
+  http.addHeader("Authorization", String("Bearer ") + otaToken);
+  http.addHeader("User-Agent", "Nama-BMS-ESP32");
+  http.addHeader("Accept", "application/vnd.github.raw");
 
   int httpCode = http.GET();
   if (httpCode != 200) {
@@ -1669,30 +1695,28 @@ void checkForOtaUpdate() {
     return;
   }
 
-  String tag = doc["tag_name"] | "";
-  String targetVersion = normalizeVersionTag(tag);
+  String targetVersion = normalizeVersionTag(doc["version"] | "");
   String currentVersion = normalizeVersionTag(String(FW_VERSION));
+  bool force = doc["force"] | false;
 
   if (targetVersion.length() == 0) {
-    Serial.println("OTA: release tag missing");
+    Serial.println("OTA: manifest version missing");
     return;
   }
 
-  if (compareVersionStrings(targetVersion, currentVersion) <= 0) {
+  if (!force && compareVersionStrings(targetVersion, currentVersion) <= 0) {
     return;
   }
 
-  JsonArray assets = doc["assets"].as<JsonArray>();
-  String fwAssetApiUrl;
-  String spiffsAssetApiUrl;
+  String fwAssetApiUrl = doc["firmwareApiUrl"] | "";
+  String spiffsAssetApiUrl = doc["spiffsApiUrl"] | "";
 
-  for (JsonObject asset : assets) {
-    String name = asset["name"] | "";
-    if (name == OTA_FW_ASSET_NAME) {
-      fwAssetApiUrl = asset["url"] | "";
-    } else if (name == OTA_SPIFFS_ASSET_NAME) {
-      spiffsAssetApiUrl = asset["url"] | "";
-    }
+  String repoBase = String("https://api.github.com/repos/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO + "/contents/";
+  if (fwAssetApiUrl.length() == 0) {
+    fwAssetApiUrl = repoBase + "ota/" + OTA_FW_ASSET_NAME + "?ref=main";
+  }
+  if (spiffsAssetApiUrl.length() == 0) {
+    spiffsAssetApiUrl = repoBase + "ota/" + OTA_SPIFFS_ASSET_NAME + "?ref=main";
   }
 
   if (fwAssetApiUrl.length() == 0 && spiffsAssetApiUrl.length() == 0) {
