@@ -120,6 +120,10 @@ function App() {
       {showServiceModal && (
         <ServiceModal onClose={() => setShowServiceModal(false)} />
       )}
+
+      <footer className="py-4 text-center text-sm text-blue-100/90">
+        nama mobility 2026. v1.151
+      </footer>
     </div>
   );
 }

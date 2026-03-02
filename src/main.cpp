@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
 #include <SPIFFS.h>
@@ -141,6 +142,8 @@ size_t energyHistoryCount = 0;
 uint32_t lastDayIndex = 0;
 float lastDayEnergyIn = 0.0f;
 float lastDayEnergyOut = 0.0f;
+Preferences energyPrefs;
+bool energyPrefsReady = false;
 
 Config config;
 AsyncWebServer server(80);
@@ -181,7 +184,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 600000;
-constexpr char FW_VERSION[] = "1.0.4";
+constexpr char FW_VERSION[] = "1.0.5";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -222,6 +225,9 @@ float readCurrentSensor(uint8_t pin, float calibration);
 void updateDerivedConfig();
 void addEnergyHistory(float energyIn, float energyOut);
 void clearEnergyHistory();
+void initEnergyStorage();
+void loadEnergyHistoryFromStorage();
+void saveEnergyHistoryToStorage();
 void initDisplay();
 void updateDisplay();
 bool applyFixedCrmConfig();
@@ -243,6 +249,8 @@ void setup() {
 
   EEPROM.begin(EEPROM_SIZE);
   loadConfig();
+  initEnergyStorage();
+  loadEnergyHistoryFromStorage();
 
   initPins();
   initWiFi();
@@ -257,14 +265,17 @@ void setup() {
   setAllOutputsOff();
   currentState = IDLE;
   
-  lastDayIndex = millis() / 86400000UL;
-  lastDayEnergyIn = config.totalEnergyIn;
-  lastDayEnergyOut = config.totalEnergyOut;
-  uint16_t year = 2026;
-  uint8_t month = 2;
-  uint8_t day = 11;
-  energyHistory[0] = {year, month, day, 0.0f, 0.0f};
-  energyHistoryCount = 1;
+  if (energyHistoryCount == 0) {
+    lastDayIndex = millis() / 86400000UL;
+    lastDayEnergyIn = config.totalEnergyIn;
+    lastDayEnergyOut = config.totalEnergyOut;
+    uint16_t year = 2026;
+    uint8_t month = 2;
+    uint8_t day = 11;
+    energyHistory[0] = {year, month, day, 0.0f, 0.0f};
+    energyHistoryCount = 1;
+    saveEnergyHistoryToStorage();
+  }
   
   Serial.println("BMS System Initialized");
 
@@ -888,6 +899,7 @@ void updateEnergy() {
     lastSocSaveMs = now;
     lastSavedSoc = config.soc;
     saveConfig();
+    saveEnergyHistoryToStorage();
   }
 }
 
@@ -1277,6 +1289,7 @@ void addEnergyHistory(float energyIn, float energyOut) {
       }
       energyHistory[MAX_HISTORY_DAYS - 1] = {year, month, day, 0.0f, 0.0f};
     }
+    saveEnergyHistoryToStorage();
   }
 }
 
@@ -1285,6 +1298,53 @@ void clearEnergyHistory() {
   lastDayIndex = 0;
   lastDayEnergyIn = 0.0f;
   lastDayEnergyOut = 0.0f;
+  saveEnergyHistoryToStorage();
+}
+
+void initEnergyStorage() {
+  energyPrefsReady = energyPrefs.begin("energy", false);
+  if (!energyPrefsReady) {
+    Serial.println("Energy storage init failed");
+  }
+}
+
+void loadEnergyHistoryFromStorage() {
+  if (!energyPrefsReady) return;
+
+  uint32_t storedCount = energyPrefs.getUInt("cnt", 0);
+  if (storedCount > MAX_HISTORY_DAYS) {
+    storedCount = MAX_HISTORY_DAYS;
+  }
+
+  if (storedCount > 0) {
+    size_t expectedSize = storedCount * sizeof(EnergyRecord);
+    size_t loadedSize = energyPrefs.getBytes("rec", energyHistory, expectedSize);
+    if (loadedSize == expectedSize) {
+      energyHistoryCount = storedCount;
+    } else {
+      energyHistoryCount = 0;
+    }
+  } else {
+    energyHistoryCount = 0;
+  }
+
+  lastDayIndex = energyPrefs.getULong("didx", millis() / 86400000UL);
+  lastDayEnergyIn = energyPrefs.getFloat("din", config.totalEnergyIn);
+  lastDayEnergyOut = energyPrefs.getFloat("dout", config.totalEnergyOut);
+}
+
+void saveEnergyHistoryToStorage() {
+  if (!energyPrefsReady) return;
+
+  energyPrefs.putUInt("cnt", static_cast<uint32_t>(energyHistoryCount));
+  if (energyHistoryCount > 0) {
+    energyPrefs.putBytes("rec", energyHistory, energyHistoryCount * sizeof(EnergyRecord));
+  } else {
+    energyPrefs.remove("rec");
+  }
+  energyPrefs.putULong("didx", lastDayIndex);
+  energyPrefs.putFloat("din", lastDayEnergyIn);
+  energyPrefs.putFloat("dout", lastDayEnergyOut);
 }
 
 void initDisplay() {
