@@ -181,7 +181,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 600000;
-constexpr char FW_VERSION[] = "1.0.3";
+constexpr char FW_VERSION[] = "1.0.4";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
