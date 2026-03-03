@@ -67,7 +67,7 @@ constexpr uint8_t CURRENT_SENSOR1_PIN = 33; // Hass400S sensor 1 (ADC)
 constexpr uint8_t CURRENT_SENSOR2_PIN = 32; // Hass400S sensor 2 (ADC)
 
 constexpr uint32_t EEPROM_MAGIC = 0xB052026;
-constexpr uint16_t EEPROM_VERSION = 4;
+constexpr uint16_t EEPROM_VERSION = 5;
 constexpr size_t EEPROM_SIZE = 1024;
 
 constexpr float ADC_REF_VOLT = 3.3f;
@@ -184,7 +184,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
-constexpr char FW_VERSION[] = "1.0.12";
+constexpr char FW_VERSION[] = "1.0.13";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -751,13 +751,13 @@ void loadConfig() {
     config.magic = EEPROM_MAGIC;
     config.version = EEPROM_VERSION;
     config.batteryType = 0;
-    config.seriesCount = 16;
-    config.cellCapacity = 100.0f;
-    config.maxChargeCurrent = 100.0f;
-    config.maxDischargeCurrent = 100.0f;
-    config.prechargeTime = 2.0f;
-    config.mosfetOnTime = 10.0f;
-    config.shortCircuitThreshold = 200.0f;
+    config.seriesCount = 24;
+    config.cellCapacity = 314.0f;
+    config.maxChargeCurrent = 300.0f;
+    config.maxDischargeCurrent = 600.0f;
+    config.prechargeTime = 10.0f;
+    config.mosfetOnTime = 0.0f;
+    config.shortCircuitThreshold = 800.0f;
     config.sensor1Calibration = 1.0f;
     config.sensor2Calibration = 1.0f;
     config.soc = 100.0f;
@@ -777,16 +777,26 @@ void loadConfig() {
       config.crmUrl[0] = '\0';
       config.crmApiKey[0] = '\0';
       needsSave = true;
+    } else if (config.version == 4) {
+      config.version = EEPROM_VERSION;
+      config.seriesCount = 24;
+      config.cellCapacity = 314.0f;
+      config.maxChargeCurrent = 300.0f;
+      config.maxDischargeCurrent = 600.0f;
+      config.prechargeTime = 10.0f;
+      config.mosfetOnTime = 0.0f;
+      config.shortCircuitThreshold = 800.0f;
+      needsSave = true;
     } else {
       config.version = EEPROM_VERSION;
       config.batteryType = 0;
-      config.seriesCount = 16;
-      config.cellCapacity = 100.0f;
-      config.maxChargeCurrent = 100.0f;
-      config.maxDischargeCurrent = 100.0f;
-      config.prechargeTime = 2.0f;
-      config.mosfetOnTime = 10.0f;
-      config.shortCircuitThreshold = 200.0f;
+      config.seriesCount = 24;
+      config.cellCapacity = 314.0f;
+      config.maxChargeCurrent = 300.0f;
+      config.maxDischargeCurrent = 600.0f;
+      config.prechargeTime = 10.0f;
+      config.mosfetOnTime = 0.0f;
+      config.shortCircuitThreshold = 800.0f;
       config.sensor1Calibration = 1.0f;
       config.sensor2Calibration = 1.0f;
       config.soc = 100.0f;
