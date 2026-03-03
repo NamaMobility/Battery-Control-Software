@@ -184,7 +184,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
-constexpr char FW_VERSION[] = "1.0.9";
+constexpr char FW_VERSION[] = "1.0.10";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -195,7 +195,7 @@ volatile bool crmEmergencyPending = false;
 volatile bool otaCheckPending = false;
 TaskHandle_t crmTaskHandle = NULL;
 
-const char *servicePassword = "nama2024";
+const char *servicePassword = "nama2026";
 
 void initPins();
 void initWiFi();
