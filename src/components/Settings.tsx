@@ -94,7 +94,7 @@ export default function Settings({ onServiceClick, batteryData }: SettingsProps)
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Service-Password': 'nama2024',
+          'X-Service-Password': 'nama2026',
         },
         body: JSON.stringify(payload),
       });
@@ -137,7 +137,7 @@ export default function Settings({ onServiceClick, batteryData }: SettingsProps)
       try {
         await fetch('/api/clear-history', {
           method: 'POST',
-          headers: { 'X-Service-Password': 'nama2024' },
+          headers: { 'X-Service-Password': 'nama2026' },
         });
         setSaved(true);
         setTimeout(() => setSaved(false), 3000);

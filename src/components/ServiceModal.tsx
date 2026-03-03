@@ -13,7 +13,7 @@ export default function ServiceModal({ onClose }: ServiceModalProps) {
   const [success, setSuccess] = useState(false);
 
   const handleAuthenticate = () => {
-    if (password === 'nama2024') {
+    if (password === 'nama2026') {
       setAuthenticated(true);
       setError('');
     } else {
@@ -27,7 +27,7 @@ export default function ServiceModal({ onClose }: ServiceModalProps) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-Service-Password': 'nama2024',
+          'X-Service-Password': 'nama2026',
         },
         body: JSON.stringify({
           socReference: parseFloat(socReference),

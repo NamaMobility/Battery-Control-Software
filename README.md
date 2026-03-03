@@ -134,7 +134,7 @@ Arayüz aşağıdaki API endpoint'lerini kullanır:
 
 ## Servis Modu
 
-Servis moduna erişmek için "Servis Modu" butonuna tıklayın. Varsayılan şifre: `nama2024`
+Servis moduna erişmek için "Servis Modu" butonuna tıklayın. Varsayılan şifre: `nama2026`
 
 ## Güvenlik Notları
 
