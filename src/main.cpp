@@ -184,7 +184,7 @@ bool ledOutputState = false;
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 600000;
-constexpr char FW_VERSION[] = "1.0.6";
+constexpr char FW_VERSION[] = "1.0.7";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -192,6 +192,7 @@ bool wifiApFallbackActive = false;
 
 volatile bool crmStartPending = false;
 volatile bool crmEmergencyPending = false;
+volatile bool otaCheckPending = false;
 TaskHandle_t crmTaskHandle = NULL;
 
 const char *servicePassword = "nama2024";
@@ -721,6 +722,22 @@ void initWebServer() {
       triggerVirtualButtonPress(pressDurationMs);
       request->send(200, "application/json", "{\"success\":true}");
     });
+
+  server.on("/api/ota-check", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (!request->hasHeader("X-Service-Password") ||
+        request->getHeader("X-Service-Password")->value() != servicePassword) {
+      request->send(403, "application/json", "{\"success\":false,\"error\":\"forbidden\"}");
+      return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      request->send(400, "application/json", "{\"success\":false,\"error\":\"wifi_not_connected\"}");
+      return;
+    }
+
+    otaCheckPending = true;
+    request->send(202, "application/json", "{\"success\":true,\"queued\":true}");
+  });
 
   server.begin();
   Serial.println("Web Server Started");
@@ -1833,38 +1850,41 @@ void crmTask(void *param) {
   unsigned long lastPush = 0;
   unsigned long lastPoll = 0;
   unsigned long lastOtaCheck = 0;
-  bool ready = false;
+  bool networkReady = false;
 
   for (;;) {
     vTaskDelay(50 / portTICK_PERIOD_MS);
 
-    if (WiFi.status() != WL_CONNECTED || config.crmUrl[0] == '\0') {
-      ready = false;
+    if (WiFi.status() != WL_CONNECTED) {
+      networkReady = false;
       continue;
     }
 
     unsigned long now = millis();
+    bool crmReady = config.crmUrl[0] != '\0' && config.crmApiKey[0] != '\0';
 
-    if (!ready) {
-      ready = true;
+    if (!networkReady) {
+      networkReady = true;
       lastPush = now - CRM_PUSH_INTERVAL_MS;
+      lastPoll = now - CRM_POLL_INTERVAL_MS;
       lastOtaCheck = now - OTA_CHECK_INTERVAL_MS;
-      Serial.printf("CRM ready (Core %d). Heap: %u, DNS: %s\n",
+      Serial.printf("Network ready (Core %d). Heap: %u, DNS: %s\n",
         xPortGetCoreID(), ESP.getFreeHeap(), WiFi.dnsIP().toString().c_str());
     }
 
-    if (now - lastPoll >= CRM_POLL_INTERVAL_MS) {
+    if (crmReady && now - lastPoll >= CRM_POLL_INTERVAL_MS) {
       lastPoll = now;
       pollCommandsFromCrm();
     }
 
-    if (now - lastPush >= CRM_PUSH_INTERVAL_MS) {
+    if (crmReady && now - lastPush >= CRM_PUSH_INTERVAL_MS) {
       lastPush = now;
       pushTelemetryToCrm();
     }
 
-    if (now - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
+    if (otaCheckPending || now - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
       lastOtaCheck = now;
+      otaCheckPending = false;
       checkForOtaUpdate();
     }
   }
