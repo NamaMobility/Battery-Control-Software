@@ -180,11 +180,13 @@ unsigned long lastButtonRelease = 0;
 uint8_t buttonPressCount = 0;
 bool shutdownPending = false;
 bool ledOutputState = false;
+unsigned long emergencyInputReleasedMs = 0;
 
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 500;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 10;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
-constexpr char FW_VERSION[] = "1.0.13";
+constexpr unsigned long EMERGENCY_CLEAR_STABLE_MS = 300;
+constexpr char FW_VERSION[] = "1.0.15";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -232,6 +234,7 @@ void startSequence();
 void triggerEmergencyStop();
 void triggerFault(const String &message);
 void clearFault();
+void autoClearEmergencyIfReleased();
 void handleButton();
 void processButtonRelease(unsigned long pressDuration, unsigned long now);
 void triggerVirtualButtonPress(unsigned long pressDurationMs);
@@ -298,6 +301,7 @@ void setup() {
 
 void loop() {
   updateInputs();
+  autoClearEmergencyIfReleased();
   handleButton();
   updateSensors();
   updateStateMachine();
@@ -863,11 +867,30 @@ void updateInputs() {
 
   if (emergencyInputActive) {
     triggerEmergencyStop();
+    emergencyInputReleasedMs = 0;
+  } else if (emergencyInputReleasedMs == 0) {
+    // Latch is cleared only after emergency input remains released for a short stable time.
+    emergencyInputReleasedMs = millis();
   }
 
   if (contactSwitchActive && !lastContactSwitchActive) {
     handleContactSwitchClose();
   }
+}
+
+void autoClearEmergencyIfReleased() {
+  if (!emergencyStopLatched) return;
+  if (emergencyInputActive) return;
+  if (emergencyInputReleasedMs == 0) return;
+
+  unsigned long now = millis();
+  if (now - emergencyInputReleasedMs < EMERGENCY_CLEAR_STABLE_MS) return;
+
+  emergencyStopLatched = false;
+  faultMessage = "";
+  currentState = IDLE;
+  setAllOutputsOff();
+  Serial.println("Emergency stop auto-cleared (input released)");
 }
 
 void updateSensors() {
@@ -1268,10 +1291,16 @@ void triggerFault(const String &message) {
 }
 
 void clearFault() {
+  if (emergencyStopLatched && emergencyInputActive) {
+    Serial.println("Emergency input still active, clear blocked");
+    return;
+  }
+
   if (currentState == FAULT || emergencyStopLatched) {
     faultMessage = "";
     currentState = IDLE;
     emergencyStopLatched = false;
+    emergencyInputReleasedMs = 0;
     setAllOutputsOff();
     Serial.println("Fault/Emergency cleared");
   }
@@ -2001,3 +2030,9 @@ void pollCommandsFromCrm() {
   http.end();
   if (secClient) delete secClient;
 }
+
+
+
+
+
+
