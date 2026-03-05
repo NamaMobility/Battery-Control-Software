@@ -181,8 +181,8 @@ uint8_t buttonPressCount = 0;
 bool shutdownPending = false;
 bool ledOutputState = false;
 
-constexpr unsigned long CRM_PUSH_INTERVAL_MS = 15000;
-constexpr unsigned long CRM_POLL_INTERVAL_MS = 200;
+constexpr unsigned long CRM_PUSH_INTERVAL_MS = 500;
+constexpr unsigned long CRM_POLL_INTERVAL_MS = 10;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
 constexpr char FW_VERSION[] = "1.0.13";
 
