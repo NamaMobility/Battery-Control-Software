@@ -855,8 +855,10 @@ bool applyFixedCrmConfig() {
 
 void updateInputs() {
   lastContactSwitchActive = contactSwitchActive;
-  contactSwitchActive = digitalRead(CONTACT_SWITCH_PIN) == HIGH;
-  bmsSignalActive = digitalRead(BMS_SIGNAL_PIN) == LOW;
+  // CONTACT_SWITCH_PIN: GND aktif
+  contactSwitchActive = digitalRead(CONTACT_SWITCH_PIN) == LOW;
+  // BMS_SIGNAL_PIN: HIGH aktif
+  bmsSignalActive = digitalRead(BMS_SIGNAL_PIN) == HIGH;
   emergencyInputActive = digitalRead(EMERGENCY_STOP_PIN) == LOW;
 
   if (emergencyInputActive) {
@@ -1911,7 +1913,9 @@ void crmTask(void *param) {
       pushTelemetryToCrm();
     }
 
-    if (otaCheckPending || now - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
+    // Beklenmedik restart olmamasi icin OTA sadece manuel tetikleme ile calissin.
+    // Manuel tetikleme: /api/ota-check
+    if (otaCheckPending) {
       lastOtaCheck = now;
       otaCheckPending = false;
       checkForOtaUpdate();
