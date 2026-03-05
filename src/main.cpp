@@ -181,12 +181,15 @@ uint8_t buttonPressCount = 0;
 bool shutdownPending = false;
 bool ledOutputState = false;
 unsigned long emergencyInputReleasedMs = 0;
+bool emergencyRawInputActive = false;
+unsigned long emergencyRawChangedMs = 0;
 
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 500;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 10;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
-constexpr unsigned long EMERGENCY_CLEAR_STABLE_MS = 300;
-constexpr char FW_VERSION[] = "1.0.15";
+constexpr unsigned long EMERGENCY_INPUT_DEBOUNCE_MS = 80;
+constexpr unsigned long EMERGENCY_CLEAR_STABLE_MS = 800;
+constexpr char FW_VERSION[] = "1.0.16";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -270,6 +273,9 @@ void setup() {
   loadEnergyHistoryFromStorage();
 
   initPins();
+  emergencyRawInputActive = digitalRead(EMERGENCY_STOP_PIN) == LOW;
+  emergencyInputActive = emergencyRawInputActive;
+  emergencyRawChangedMs = millis();
   initWiFi();
 
   if (!SPIFFS.begin(true)) {
@@ -863,14 +869,25 @@ void updateInputs() {
   contactSwitchActive = digitalRead(CONTACT_SWITCH_PIN) == LOW;
   // BMS_SIGNAL_PIN: HIGH aktif
   bmsSignalActive = digitalRead(BMS_SIGNAL_PIN) == HIGH;
-  emergencyInputActive = digitalRead(EMERGENCY_STOP_PIN) == LOW;
+
+  bool rawEmergencyActive = digitalRead(EMERGENCY_STOP_PIN) == LOW;
+  unsigned long now = millis();
+
+  if (rawEmergencyActive != emergencyRawInputActive) {
+    emergencyRawInputActive = rawEmergencyActive;
+    emergencyRawChangedMs = now;
+  }
+
+  if (now - emergencyRawChangedMs >= EMERGENCY_INPUT_DEBOUNCE_MS) {
+    emergencyInputActive = emergencyRawInputActive;
+  }
 
   if (emergencyInputActive) {
     triggerEmergencyStop();
     emergencyInputReleasedMs = 0;
   } else if (emergencyInputReleasedMs == 0) {
     // Latch is cleared only after emergency input remains released for a short stable time.
-    emergencyInputReleasedMs = millis();
+    emergencyInputReleasedMs = now;
   }
 
   if (contactSwitchActive && !lastContactSwitchActive) {
@@ -2030,9 +2047,4 @@ void pollCommandsFromCrm() {
   http.end();
   if (secClient) delete secClient;
 }
-
-
-
-
-
 
