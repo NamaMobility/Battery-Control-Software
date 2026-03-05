@@ -183,13 +183,16 @@ bool ledOutputState = false;
 unsigned long emergencyInputReleasedMs = 0;
 bool emergencyRawInputActive = false;
 unsigned long emergencyRawChangedMs = 0;
+bool emergencyCommandLatched = false;
+unsigned long emergencyCommandStartMs = 0;
 
 constexpr unsigned long CRM_PUSH_INTERVAL_MS = 500;
 constexpr unsigned long CRM_POLL_INTERVAL_MS = 10;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
 constexpr unsigned long EMERGENCY_INPUT_DEBOUNCE_MS = 80;
 constexpr unsigned long EMERGENCY_CLEAR_STABLE_MS = 800;
-constexpr char FW_VERSION[] = "1.0.16";
+constexpr unsigned long UI_EMERGENCY_TIMEOUT_MS = 10000;
+constexpr char FW_VERSION[] = "1.0.17";
 
 unsigned long lastWifiCheckMs = 0;
 constexpr unsigned long WIFI_CHECK_INTERVAL_MS = 30000;
@@ -234,7 +237,7 @@ void updateEnergy();
 void updateStateMachine();
 void updateLed();
 void startSequence();
-void triggerEmergencyStop();
+void triggerEmergencyStop(bool fromCommand = false);
 void triggerFault(const String &message);
 void clearFault();
 void autoClearEmergencyIfReleased();
@@ -650,7 +653,7 @@ void initWebServer() {
     });
 
   server.on("/api/emergency", HTTP_POST, [](AsyncWebServerRequest *request){
-    triggerEmergencyStop();
+    triggerEmergencyStop(true);
     request->send(200, "application/json", "{\"success\":true}");
   });
 
@@ -883,7 +886,7 @@ void updateInputs() {
   }
 
   if (emergencyInputActive) {
-    triggerEmergencyStop();
+    triggerEmergencyStop(false);
     emergencyInputReleasedMs = 0;
   } else if (emergencyInputReleasedMs == 0) {
     // Latch is cleared only after emergency input remains released for a short stable time.
@@ -897,15 +900,31 @@ void updateInputs() {
 
 void autoClearEmergencyIfReleased() {
   if (!emergencyStopLatched) return;
-  if (emergencyInputActive) return;
-  if (emergencyInputReleasedMs == 0) return;
 
   unsigned long now = millis();
+
+  if (emergencyCommandLatched && now - emergencyCommandStartMs >= UI_EMERGENCY_TIMEOUT_MS) {
+    emergencyCommandLatched = false;
+    emergencyCommandStartMs = 0;
+    Serial.println("UI emergency timeout elapsed");
+  }
+
+  if (emergencyInputActive || emergencyCommandLatched) {
+    emergencyInputReleasedMs = 0;
+    return;
+  }
+
+  if (emergencyInputReleasedMs == 0) {
+    emergencyInputReleasedMs = now;
+    return;
+  }
+
   if (now - emergencyInputReleasedMs < EMERGENCY_CLEAR_STABLE_MS) return;
 
   emergencyStopLatched = false;
   faultMessage = "";
   currentState = IDLE;
+  emergencyCommandStartMs = 0;
   setAllOutputsOff();
   Serial.println("Emergency stop auto-cleared (input released)");
 }
@@ -1288,13 +1307,21 @@ void startSequence() {
   }
 }
 
-void triggerEmergencyStop() {
-  if (!emergencyStopLatched) {
-    emergencyStopLatched = true;
-    currentState = EMERGENCY_STOP;
-    faultMessage = "Acil stop aktif";
-    setAllOutputsOff();
-    Serial.println("EMERGENCY STOP ACTIVATED");
+void triggerEmergencyStop(bool fromCommand) {
+  if (fromCommand) {
+    emergencyCommandLatched = true;
+    emergencyCommandStartMs = millis();
+  }
+
+  emergencyStopLatched = true;
+  currentState = EMERGENCY_STOP;
+  faultMessage = fromCommand ? "Acil durdur aktif" : "Acil stop aktif";
+  setAllOutputsOff();
+
+  if (fromCommand) {
+    Serial.println("EMERGENCY STOP ACTIVATED (UI/CRM)");
+  } else {
+    Serial.println("EMERGENCY STOP ACTIVATED (hardware)");
   }
 }
 
@@ -1318,6 +1345,8 @@ void clearFault() {
     currentState = IDLE;
     emergencyStopLatched = false;
     emergencyInputReleasedMs = 0;
+    emergencyCommandLatched = false;
+    emergencyCommandStartMs = 0;
     setAllOutputsOff();
     Serial.println("Fault/Emergency cleared");
   }
@@ -1683,7 +1712,7 @@ void processCrmCommands() {
   }
   if (crmEmergencyPending) {
     crmEmergencyPending = false;
-    triggerEmergencyStop();
+    triggerEmergencyStop(true);
     Serial.println("CRM: emergency stop executed");
   }
   while (crmButtonQueueHead != crmButtonQueueTail) {
