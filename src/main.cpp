@@ -195,6 +195,19 @@ volatile bool crmEmergencyPending = false;
 volatile bool otaCheckPending = false;
 TaskHandle_t crmTaskHandle = NULL;
 
+constexpr size_t CRM_BUTTON_QUEUE_SIZE = 16;
+volatile unsigned long crmButtonQueue[CRM_BUTTON_QUEUE_SIZE];
+volatile uint8_t crmButtonQueueHead = 0;
+volatile uint8_t crmButtonQueueTail = 0;
+
+void enqueueCrmButton(unsigned long durationMs) {
+  uint8_t nextTail = (crmButtonQueueTail + 1) % CRM_BUTTON_QUEUE_SIZE;
+  if (nextTail != crmButtonQueueHead) {
+    crmButtonQueue[crmButtonQueueTail] = durationMs;
+    crmButtonQueueTail = nextTail;
+  }
+}
+
 const char *servicePassword = "nama2026";
 
 void initPins();
@@ -1625,6 +1638,12 @@ void processCrmCommands() {
     triggerEmergencyStop();
     Serial.println("CRM: emergency stop executed");
   }
+  while (crmButtonQueueHead != crmButtonQueueTail) {
+    unsigned long dur = crmButtonQueue[crmButtonQueueHead];
+    crmButtonQueueHead = (crmButtonQueueHead + 1) % CRM_BUTTON_QUEUE_SIZE;
+    triggerVirtualButtonPress(dur);
+    Serial.printf("CRM: button press executed (%lu ms)\n", dur);
+  }
 }
 
 String normalizeVersionTag(const String &versionTag) {
@@ -1942,6 +1961,10 @@ void pollCommandsFromCrm() {
             crmStartPending = true;
           } else if (strcmp(type, "emergency") == 0) {
             crmEmergencyPending = true;
+          } else if (strcmp(type, "button") == 0) {
+            JsonObject pl = cmd["payload"].as<JsonObject>();
+            unsigned long dur = pl["durationMs"] | 120UL;
+            enqueueCrmButton(dur);
           } else if (strcmp(type, "config") == 0) {
             JsonObject pl = cmd["payload"].as<JsonObject>();
             if (!pl.isNull()) {
