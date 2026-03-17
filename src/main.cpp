@@ -74,7 +74,7 @@ constexpr float ADC_REF_VOLT = 3.3f;
 constexpr float ADC_MAX = 4095.0f;
 constexpr float HASS_ZERO_VOLT = 1.65f;
 constexpr float HASS_SENSITIVITY = 0.025f;
-constexpr char CRM_FIXED_URL[] = "https://www.namacloud.com/";
+constexpr char CRM_FIXED_URL[] = "";
 constexpr char CRM_FIXED_API_KEY[] = "nama-bms-2523f8bb-56b2-4595-9365-89825d91c97d";
 
 #define SCREEN_WIDTH 128

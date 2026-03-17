@@ -1,5 +1,5 @@
 {
-    "version":  "1.0.17",
+    "version":  "1.0.18",
     "force":  false,
     "firmwareApiUrl": "https://raw.githubusercontent.com/NamaMobility/Battery-Control-Software/main/ota/firmware.bin",
     "spiffsApiUrl": "https://raw.githubusercontent.com/NamaMobility/Battery-Control-Software/main/ota/spiffs.bin"
