@@ -186,8 +186,8 @@ unsigned long emergencyRawChangedMs = 0;
 bool emergencyCommandLatched = false;
 unsigned long emergencyCommandStartMs = 0;
 
-constexpr unsigned long CRM_PUSH_INTERVAL_MS = 500;
-constexpr unsigned long CRM_POLL_INTERVAL_MS = 10;
+constexpr unsigned long CRM_PUSH_INTERVAL_MS = 360000;
+constexpr unsigned long CRM_POLL_INTERVAL_MS = 360000;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
 constexpr unsigned long EMERGENCY_INPUT_DEBOUNCE_MS = 80;
 constexpr unsigned long EMERGENCY_CLEAR_STABLE_MS = 800;
