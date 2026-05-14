@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <PubSubClient.h>
 #include <Update.h>
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
@@ -13,6 +14,7 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+#include <time.h>
 
 #if __has_include("ota_secrets.h")
 #include "ota_secrets.h"
@@ -74,8 +76,17 @@ constexpr float ADC_REF_VOLT = 3.3f;
 constexpr float ADC_MAX = 4095.0f;
 constexpr float HASS_ZERO_VOLT = 1.65f;
 constexpr float HASS_SENSITIVITY = 0.025f;
-constexpr char CRM_FIXED_URL[] = "";
-constexpr char CRM_FIXED_API_KEY[] = "nama-bms-2523f8bb-56b2-4595-9365-89825d91c97d";
+constexpr char CRM_FIXED_URL[] = "https://api.namacloud.com";
+#ifndef CRM_FIXED_API_KEY
+#define CRM_FIXED_API_KEY "nama-bms-2523f8bb-56b2-4595-9365-89825d91c97d"
+#endif
+constexpr char CRM_FIXED_API_KEY_CONST[] = CRM_FIXED_API_KEY;
+
+// MQTT: cihaz -> VPS broker iletişimi
+constexpr char MQTT_FIXED_USER[] = "bmsmqtt";
+constexpr uint16_t MQTT_PORT = 8883;
+constexpr char MQTT_FIXED_HOST_IP[] = "185.231.111.46"; // Debug fallback target (disabled in secure mode)
+constexpr bool MQTT_ALLOW_INSECURE_FALLBACK = false;    // Production: keep false
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -148,6 +159,15 @@ bool energyPrefsReady = false;
 Config config;
 AsyncWebServer server(80);
 
+// MQTT client (telemetri publish, komut subscribe)
+WiFiClientSecure mqttWiFiClient;
+PubSubClient mqttClient(mqttWiFiClient);
+String mqttMac;
+String mqttTelemetryTopic;
+String mqttCmdTopic;
+bool mqttCmdSubscribed = false;
+unsigned long lastMqttReconnectMs = 0;
+
 SystemState currentState = IDLE;
 LedMode currentLedMode = LED_OFF;
 
@@ -155,7 +175,7 @@ bool emergencyStopLatched = false;
 bool emergencyInputActive = false;
 bool contactSwitchActive = false;
 bool lastContactSwitchActive = false;
-bool bmsSignalActive = false;
+bool bmsSignalActive = true;
 
 bool chargeRelayState = false;
 bool dischargeRelayState = false;
@@ -186,8 +206,8 @@ unsigned long emergencyRawChangedMs = 0;
 bool emergencyCommandLatched = false;
 unsigned long emergencyCommandStartMs = 0;
 
-constexpr unsigned long CRM_PUSH_INTERVAL_MS = 360000;
-constexpr unsigned long CRM_POLL_INTERVAL_MS = 360000;
+constexpr unsigned long CRM_PUSH_INTERVAL_MS = 1000;
+constexpr unsigned long CRM_POLL_INTERVAL_MS = 500;
 constexpr unsigned long OTA_CHECK_INTERVAL_MS = 60000;
 constexpr unsigned long EMERGENCY_INPUT_DEBOUNCE_MS = 80;
 constexpr unsigned long EMERGENCY_CLEAR_STABLE_MS = 800;
@@ -200,6 +220,7 @@ bool wifiApFallbackActive = false;
 
 volatile bool crmStartPending = false;
 volatile bool crmEmergencyPending = false;
+volatile bool crmBypassPending = false;
 volatile bool otaCheckPending = false;
 TaskHandle_t crmTaskHandle = NULL;
 
@@ -207,16 +228,78 @@ constexpr size_t CRM_BUTTON_QUEUE_SIZE = 16;
 volatile unsigned long crmButtonQueue[CRM_BUTTON_QUEUE_SIZE];
 volatile uint8_t crmButtonQueueHead = 0;
 volatile uint8_t crmButtonQueueTail = 0;
+String crmButtonCmdIdQueue[CRM_BUTTON_QUEUE_SIZE];
+String crmStartCmdId;
+String crmEmergencyCmdId;
+String crmBypassCmdId;
 
-void enqueueCrmButton(unsigned long durationMs) {
+struct CommandAckItem {
+  String id;
+  String status;
+  String error;
+};
+constexpr size_t CRM_ACK_QUEUE_SIZE = 16;
+CommandAckItem crmAckQueue[CRM_ACK_QUEUE_SIZE];
+volatile uint8_t crmAckQueueHead = 0;
+volatile uint8_t crmAckQueueTail = 0;
+unsigned long lastAckRetryMs = 0;
+constexpr unsigned long ACK_RETRY_INTERVAL_MS = 2000;
+
+void enqueueCrmButton(unsigned long durationMs, const String &commandId = "") {
   uint8_t nextTail = (crmButtonQueueTail + 1) % CRM_BUTTON_QUEUE_SIZE;
   if (nextTail != crmButtonQueueHead) {
     crmButtonQueue[crmButtonQueueTail] = durationMs;
+    crmButtonCmdIdQueue[crmButtonQueueTail] = commandId;
     crmButtonQueueTail = nextTail;
   }
 }
 
-const char *servicePassword = "nama2026";
+#ifndef SERVICE_PASSWORD
+#define SERVICE_PASSWORD "nama2026"
+#endif
+const char *servicePassword = SERVICE_PASSWORD;
+bool isServicePasswordConfigured() {
+  return servicePassword != nullptr && strlen(servicePassword) > 0;
+}
+
+// Let's Encrypt E7 intermediate CA (chain seen on api.namacloud.com:8883).
+static const char MQTT_TLS_ROOT_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIEVzCCAj+gAwIBAgIRAKp18eYrjwoiCWbTi7/UuqEwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMjQwMzEzMDAwMDAw
+WhcNMjcwMzEyMjM1OTU5WjAyMQswCQYDVQQGEwJVUzEWMBQGA1UEChMNTGV0J3Mg
+RW5jcnlwdDELMAkGA1UEAxMCRTcwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAARB6AST
+CFh/vjcwDMCgQer+VtqEkz7JANurZxLP+U9TCeioL6sp5Z8VRvRbYk4P1INBmbef
+QHJFHCxcSjKmwtvGBWpl/9ra8HW0QDsUaJW2qOJqceJ0ZVFT3hbUHifBM/2jgfgw
+gfUwDgYDVR0PAQH/BAQDAgGGMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcD
+ATASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBSuSJ7chx1EoG/aouVgdAR4
+wpwAgDAfBgNVHSMEGDAWgBR5tFnme7bl5AFzgAiIyBpY9umbbjAyBggrBgEFBQcB
+AQQmMCQwIgYIKwYBBQUHMAKGFmh0dHA6Ly94MS5pLmxlbmNyLm9yZy8wEwYDVR0g
+BAwwCjAIBgZngQwBAgEwJwYDVR0fBCAwHjAcoBqgGIYWaHR0cDovL3gxLmMubGVu
+Y3Iub3JnLzANBgkqhkiG9w0BAQsFAAOCAgEAjx66fDdLk5ywFn3CzA1w1qfylHUD
+aEf0QZpXcJseddJGSfbUUOvbNR9N/QQ16K1lXl4VFyhmGXDT5Kdfcr0RvIIVrNxF
+h4lqHtRRCP6RBRstqbZ2zURgqakn/Xip0iaQL0IdfHBZr396FgknniRYFckKORPG
+yM3QKnd66gtMst8I5nkRQlAg/Jb+Gc3egIvuGKWboE1G89NTsN9LTDD3PLj0dUMr
+OIuqVjLB8pEC6yk9enrlrqjXQgkLEYhXzq7dLafv5Vkig6Gl0nuuqjqfp0Q1bi1o
+yVNAlXe6aUXw92CcghC9bNsKEO1+M52YY5+ofIXlS/SEQbvVYYBLZ5yeiglV6t3S
+M6H+vTG0aP9YHzLn/KVOHzGQfXDP7qM5tkf+7diZe7o2fw6O7IvN6fsQXEQQj8TJ
+UXJxv2/uJhcuy/tSDgXwHM8Uk34WNbRT7zGTGkQRX0gsbjAea/jYAoWv0ZvQRwpq
+Pe79D/i7Cep8qWnA+7AE/3B3S/3dEEYmc0lpe1366A/6GEgk3ktr9PEoQrLChs6I
+tu3wnNLB2euC8IKGLQFpGtOO/2/hiAKjyajaBP25w1jF0Wl8Bbqne3uZ2q1GyPFJ
+YRmT7/OXpmOH/FVLtwS+8ng1cAmpCujPwteJZNcDG0sF2n/sc0+SQf49fdyUK0ty
++VUwFj9tmWxyR/M=
+-----END CERTIFICATE-----
+)EOF";
+
+// Non-MQTT HTTPS clients (OTA, auxiliary HTTPS) can use a distinct CA chain.
+// Defaulting to MQTT CA keeps backward compatibility unless explicitly changed.
+const char *HTTPS_TLS_ROOT_CA = MQTT_TLS_ROOT_CA;
+
+String lastKnownPublicIp;
+unsigned long lastPublicIpFetchMs = 0;
+constexpr unsigned long PUBLIC_IP_REFRESH_MS = 10UL * 60UL * 1000UL;
+bool tlsClockReady = false;
 
 void initPins();
 void initWiFi();
@@ -236,7 +319,7 @@ void updateSensors();
 void updateEnergy();
 void updateStateMachine();
 void updateLed();
-void startSequence();
+bool startSequence();
 void triggerEmergencyStop(bool fromCommand = false);
 void triggerFault(const String &message);
 void clearFault();
@@ -264,6 +347,11 @@ int compareVersionStrings(const String &a, const String &b);
 String getOtaGithubToken();
 bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, const String &assetLabel, bool restartAfter);
 void checkForOtaUpdate();
+bool ensureTlsClockReady();
+String fetchPublicIp();
+bool sendCommandAckToCrm(const String &commandId, const String &status, const String &errorMessage = "");
+bool enqueueCommandAck(const String &commandId, const String &status, const String &errorMessage = "");
+void flushCommandAckQueue();
 
 String faultMessage;
 
@@ -287,6 +375,11 @@ void setup() {
 
   initWebServer();
   initDisplay();
+
+  // PubSubClient default buffer is small for our telemetry JSON (especially energyHistory).
+  // Increase buffer to avoid publish failures caused by payload size.
+  mqttClient.setBufferSize(8192);
+  mqttClient.setKeepAlive(30);
 
   setAllOutputsOff();
   currentState = IDLE;
@@ -317,6 +410,7 @@ void loop() {
   updateLed();
   updateDisplay();
   processCrmCommands();
+  flushCommandAckQueue();
 
   manageWifiConnection();
 }
@@ -558,7 +652,8 @@ void initWebServer() {
 
   server.on("/api/config", HTTP_POST, [](AsyncWebServerRequest *request){}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-      if (!request->hasHeader("X-Service-Password") ||
+      if (!isServicePasswordConfigured() ||
+          !request->hasHeader("X-Service-Password") ||
           request->getHeader("X-Service-Password")->value() != servicePassword) {
         request->send(403, "application/json", "{\"success\":false,\"error\":\"forbidden\"}");
         return;
@@ -724,7 +819,8 @@ void initWebServer() {
   });
 
   server.on("/api/clear-history", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!request->hasHeader("X-Service-Password") ||
+    if (!isServicePasswordConfigured() ||
+        !request->hasHeader("X-Service-Password") ||
         request->getHeader("X-Service-Password")->value() != servicePassword) {
       request->send(403, "application/json", "{\"success\":false,\"error\":\"forbidden\"}");
       return;
@@ -750,7 +846,8 @@ void initWebServer() {
     });
 
   server.on("/api/ota-check", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (!request->hasHeader("X-Service-Password") ||
+    if (!isServicePasswordConfigured() ||
+        !request->hasHeader("X-Service-Password") ||
         request->getHeader("X-Service-Password")->value() != servicePassword) {
       request->send(403, "application/json", "{\"success\":false,\"error\":\"forbidden\"}");
       return;
@@ -857,8 +954,8 @@ bool applyFixedCrmConfig() {
     changed = true;
   }
 
-  if (strcmp(config.crmApiKey, CRM_FIXED_API_KEY) != 0) {
-    strncpy(config.crmApiKey, CRM_FIXED_API_KEY, sizeof(config.crmApiKey) - 1);
+  if (strcmp(config.crmApiKey, CRM_FIXED_API_KEY_CONST) != 0) {
+    strncpy(config.crmApiKey, CRM_FIXED_API_KEY_CONST, sizeof(config.crmApiKey) - 1);
     config.crmApiKey[sizeof(config.crmApiKey) - 1] = '\0';
     changed = true;
   }
@@ -1291,20 +1388,23 @@ void triggerVirtualButtonPress(unsigned long pressDurationMs) {
   processButtonRelease(pressDurationMs, millis());
 }
 
-void startSequence() {
-  if (emergencyStopLatched) return;
-  if (!bmsSignalActive && !config.bypassEnabled) return;
-  if (currentState != IDLE && currentState != BYPASS_MODE) return;
+bool startSequence() {
+  if (emergencyStopLatched) return false;
+  if (!bmsSignalActive && !config.bypassEnabled) return false;
+  if (currentState != IDLE && currentState != BYPASS_MODE) return false;
 
   if (config.bypassEnabled && currentState == BYPASS_MODE) {
     currentState = STARTUP;
     stateStartMs = millis();
     Serial.println("Starting in bypass mode");
+    return true;
   } else if (currentState == IDLE) {
     currentState = STARTUP;
     stateStartMs = millis();
     Serial.println("Starting sequence");
+    return true;
   }
+  return false;
 }
 
 void triggerEmergencyStop(bool fromCommand) {
@@ -1617,6 +1717,9 @@ String buildStatusJsonString() {
   } else {
     doc["mac"] = WiFi.softAPmacAddress();
   }
+  if (lastKnownPublicIp.length() > 0) {
+    doc["publicIp"] = lastKnownPublicIp;
+  }
   // EEPROM'daki günlük enerji logunu ekle (15 sn'de bir CRM'e gider)
   JsonArray historyArr = doc.createNestedArray("energyHistory");
   for (size_t i = 0; i < energyHistoryCount; i++) {
@@ -1654,6 +1757,183 @@ String extractHost(const String &baseUrl) {
   return (colon >= 0) ? hostPort.substring(0, colon) : hostPort;
 }
 
+String getDeviceMac() {
+  return (WiFi.status() == WL_CONNECTED) ? WiFi.macAddress() : WiFi.softAPmacAddress();
+}
+
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+  String msg;
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) msg += static_cast<char>(payload[i]);
+  Serial.printf("MQTT: cmd rx topic=%s len=%u payload=%s\n", topic ? topic : "(null)", length, msg.c_str());
+
+  DynamicJsonDocument doc(3072);
+  if (deserializeJson(doc, msg) != DeserializationError::Ok) {
+    Serial.println("MQTT: command JSON parse error");
+    return;
+  }
+
+  const char *type = doc["commandType"];
+  const char *cmdId = doc["id"] | "";
+  String commandId = String(cmdId ? cmdId : "");
+  commandId.trim();
+  if (!type) {
+    Serial.println("MQTT: commandType missing");
+    return;
+  }
+  Serial.printf("MQTT: commandType=%s\n", type);
+
+  if (strcmp(type, "start") == 0) {
+    crmStartPending = true;
+    crmStartCmdId = commandId;
+    Serial.println("MQTT: start queued");
+  } else if (strcmp(type, "emergency") == 0) {
+    crmEmergencyPending = true;
+    crmEmergencyCmdId = commandId;
+    Serial.println("MQTT: emergency queued");
+  } else if (strcmp(type, "bypass") == 0) {
+    crmBypassPending = true;
+    crmBypassCmdId = commandId;
+    Serial.println("MQTT: bypass queued");
+  } else if (strcmp(type, "button") == 0) {
+    JsonObject pl = doc["payload"].as<JsonObject>();
+    unsigned long dur = pl["durationMs"] | 120UL;
+    enqueueCrmButton(dur, commandId);
+    Serial.printf("MQTT: button queued durationMs=%lu\n", dur);
+  } else if (strcmp(type, "config") == 0) {
+    JsonObject pl = doc["payload"].as<JsonObject>();
+    if (!pl.isNull()) {
+      if (pl.containsKey("batteryType")) config.batteryType = pl["batteryType"] | config.batteryType;
+      if (pl.containsKey("seriesCount")) config.seriesCount = pl["seriesCount"] | config.seriesCount;
+      if (pl.containsKey("cellCapacity")) config.cellCapacity = pl["cellCapacity"] | config.cellCapacity;
+      if (pl.containsKey("maxChargeCurrent")) config.maxChargeCurrent = pl["maxChargeCurrent"] | config.maxChargeCurrent;
+      if (pl.containsKey("maxDischargeCurrent")) config.maxDischargeCurrent = pl["maxDischargeCurrent"] | config.maxDischargeCurrent;
+      if (pl.containsKey("prechargeTime")) config.prechargeTime = pl["prechargeTime"] | config.prechargeTime;
+      if (pl.containsKey("mosfetOnTime")) config.mosfetOnTime = pl["mosfetOnTime"] | config.mosfetOnTime;
+      if (pl.containsKey("shortCircuitThreshold")) config.shortCircuitThreshold = pl["shortCircuitThreshold"] | config.shortCircuitThreshold;
+      if (pl.containsKey("sensor1Calibration")) config.sensor1Calibration = pl["sensor1Calibration"] | config.sensor1Calibration;
+      if (pl.containsKey("sensor2Calibration")) config.sensor2Calibration = pl["sensor2Calibration"] | config.sensor2Calibration;
+      saveConfig();
+      Serial.println("MQTT: config updated");
+      if (commandId.length() > 0) {
+        enqueueCommandAck(commandId, "done");
+      }
+    }
+  } else {
+    Serial.printf("MQTT: unsupported commandType=%s\n", type);
+    if (commandId.length() > 0) {
+      enqueueCommandAck(commandId, "failed", "unsupported commandType");
+    }
+  }
+}
+
+bool probeMqttTls(const String &host, uint16_t port) {
+  WiFiClientSecure probe;
+  probe.setCACert(MQTT_TLS_ROOT_CA);
+  probe.setTimeout(7000);
+  Serial.printf("MQTT TLS probe: %s:%u\n", host.c_str(), port);
+  bool ok = probe.connect(host.c_str(), port);
+  if (ok) {
+    Serial.println("MQTT TLS probe OK");
+    probe.stop();
+    return true;
+  }
+  char errBuf[128] = {0};
+  int err = probe.lastError(errBuf, sizeof(errBuf));
+  Serial.printf("MQTT TLS probe FAIL err=%d msg=%s\n", err, errBuf[0] ? errBuf : "(none)");
+  probe.stop();
+  return false;
+}
+
+bool ensureMqttConnected() {
+  if (config.crmUrl[0] == '\0' || config.crmApiKey[0] == '\0') return false;
+
+  String baseUrl = getCrmBaseUrl();
+  if (baseUrl.length() < 10) return false;
+
+  String host = extractHost(baseUrl);
+  if (host.length() == 0) return false;
+
+  if (!ensureTlsClockReady()) return false;
+  mqttWiFiClient.setCACert(MQTT_TLS_ROOT_CA);
+
+  mqttMac = getDeviceMac();
+  mqttTelemetryTopic = "bms/" + mqttMac + "/telemetry";
+  mqttCmdTopic = "bms/" + mqttMac + "/cmd";
+
+  mqttClient.setServer(host.c_str(), MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  if (mqttClient.connected()) {
+    if (!mqttCmdSubscribed) {
+      bool subOk = mqttClient.subscribe(mqttCmdTopic.c_str());
+      mqttCmdSubscribed = subOk;
+      Serial.printf("MQTT already connected. subscribe(%s)=%s\n",
+        mqttCmdTopic.c_str(),
+        subOk ? "ok" : "fail");
+    }
+    return true;
+  }
+
+  unsigned long now = millis();
+  if (now - lastMqttReconnectMs < 5000) return false;
+  lastMqttReconnectMs = now;
+
+  IPAddress resolvedIp;
+  if (WiFi.hostByName(host.c_str(), resolvedIp)) {
+    Serial.printf("MQTT DNS: %s -> %s\n", host.c_str(), resolvedIp.toString().c_str());
+  } else {
+    Serial.printf("MQTT DNS FAIL: %s\n", host.c_str());
+  }
+
+  // Keep secure-by-default: fail fast with TLS diagnostics before MQTT auth.
+  if (!probeMqttTls(host, MQTT_PORT)) {
+    Serial.println("MQTT secure mode: TLS probe failed, skipping connect");
+    return false;
+  }
+
+  String clientId = "bms-" + mqttMac;
+  Serial.printf("MQTT connecting to %s:%u as %s\n", host.c_str(), MQTT_PORT, clientId.c_str());
+
+  bool ok = mqttClient.connect(clientId.c_str(), MQTT_FIXED_USER, config.crmApiKey);
+  if (ok) {
+    mqttCmdSubscribed = false;
+    bool subOk = mqttClient.subscribe(mqttCmdTopic.c_str());
+    mqttCmdSubscribed = subOk;
+    Serial.printf("MQTT connected. subscribe(%s)=%s\n",
+      mqttCmdTopic.c_str(),
+      subOk ? "ok" : "fail");
+  } else {
+    Serial.printf("MQTT connect failed, state=%d\n", mqttClient.state());
+    if (MQTT_ALLOW_INSECURE_FALLBACK) {
+      // Debug-only fallback: insecure TLS over direct IP.
+      mqttCmdSubscribed = false;
+      mqttClient.disconnect();
+      mqttWiFiClient.stop();
+      mqttWiFiClient.setInsecure();
+      mqttClient.setServer(MQTT_FIXED_HOST_IP, MQTT_PORT);
+      Serial.printf("MQTT retry via IP %s:%u (insecure debug)\n", MQTT_FIXED_HOST_IP, MQTT_PORT);
+      ok = mqttClient.connect(clientId.c_str(), MQTT_FIXED_USER, config.crmApiKey);
+      if (ok) {
+        mqttCmdSubscribed = false;
+        bool subOk = mqttClient.subscribe(mqttCmdTopic.c_str());
+        mqttCmdSubscribed = subOk;
+        Serial.printf("MQTT connected via IP. subscribe(%s)=%s\n",
+          mqttCmdTopic.c_str(),
+          subOk ? "ok" : "fail");
+      } else {
+        Serial.printf("MQTT IP retry failed, state=%d\n", mqttClient.state());
+        // Restore secure mode for next cycle.
+        mqttWiFiClient.setCACert(MQTT_TLS_ROOT_CA);
+        mqttClient.setServer(host.c_str(), MQTT_PORT);
+      }
+    } else {
+      Serial.println("MQTT secure mode: insecure IP fallback disabled");
+    }
+  }
+  return ok;
+}
+
 bool checkDns(const String &hostname) {
   IPAddress ip;
   if (WiFi.hostByName(hostname.c_str(), ip)) {
@@ -1665,61 +1945,253 @@ bool checkDns(const String &hostname) {
   return false;
 }
 
-void pushTelemetryToCrm() {
-  if (config.crmUrl[0] == '\0' || config.crmApiKey[0] == '\0') return;
-  String baseUrl = getCrmBaseUrl();
-  if (baseUrl.length() < 10) return;
+bool ensureTlsClockReady() {
+  if (tlsClockReady) return true;
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+  time_t now = time(nullptr);
+  unsigned long started = millis();
+  while (now < 1700000000 && millis() - started < 8000UL) {
+    delay(200);
+    now = time(nullptr);
+  }
+  tlsClockReady = now >= 1700000000;
+  if (!tlsClockReady) Serial.println("TLS clock sync failed");
+  return tlsClockReady;
+}
 
-  String host = extractHost(baseUrl);
-  if (host.length() == 0) return;
+String fetchPublicIp() {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  const char *httpsUrls[] = {
+    "https://api64.ipify.org",
+    "https://api.ipify.org",
+  };
+  const char *httpUrls[] = {
+    "http://api.ipify.org",
+    "http://ipv4.icanhazip.com",
+  };
 
-  String body = buildStatusJsonString();
-  String url = baseUrl + "/api/bms/telemetry";
+  if (ensureTlsClockReady()) {
+    for (size_t i = 0; i < (sizeof(httpsUrls) / sizeof(httpsUrls[0])); i++) {
+      WiFiClientSecure ipClient;
+      // ipify sertifika zinciri board kök mağazasıyla uyuşmayabiliyor; debug için insecure fallback.
+      ipClient.setInsecure();
+      ipClient.setTimeout(7000);
 
-  Serial.printf("CRM push: %s (heap: %u)\n", url.c_str(), ESP.getFreeHeap());
-
-  if (!checkDns(host)) return;
-
-  HTTPClient http;
-  WiFiClientSecure *secClient = new WiFiClientSecure;
-  if (!secClient) { Serial.println("CRM push: out of memory"); return; }
-  secClient->setInsecure();
-  secClient->setHandshakeTimeout(30);
-  http.begin(*secClient, url);
-
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setRedirectLimit(5);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-BMS-API-Key", config.crmApiKey);
-  http.setTimeout(2500);
-
-  int httpCode = http.POST(body);
-  if (httpCode > 0) {
-    Serial.printf("CRM push OK: %d\n", httpCode);
-  } else {
-    Serial.printf("CRM push FAIL(%d): %s\n", httpCode, http.errorToString(httpCode).c_str());
+      HTTPClient http;
+      if (!http.begin(ipClient, httpsUrls[i])) {
+        Serial.printf("Public IP: https http.begin failed for %s\n", httpsUrls[i]);
+        continue;
+      }
+      http.setConnectTimeout(7000);
+      http.setTimeout(7000);
+      int code = http.GET();
+      if (code != 200) {
+        Serial.printf("Public IP: HTTPS GET %s failed code=%d\n", httpsUrls[i], code);
+        http.end();
+        continue;
+      }
+      String ip = http.getString();
+      http.end();
+      ip.trim();
+      if (ip.length() > 0) {
+        Serial.printf("Public IP fetched via HTTPS %s: %s\n", httpsUrls[i], ip.c_str());
+        return ip;
+      }
+      Serial.printf("Public IP: empty HTTPS response from %s\n", httpsUrls[i]);
+    }
   }
 
+  for (size_t i = 0; i < (sizeof(httpUrls) / sizeof(httpUrls[0])); i++) {
+    WiFiClient ipClient;
+    HTTPClient http;
+    if (!http.begin(ipClient, httpUrls[i])) {
+      Serial.printf("Public IP: http.begin failed for %s\n", httpUrls[i]);
+      continue;
+    }
+    http.setConnectTimeout(7000);
+    http.setTimeout(7000);
+    int code = http.GET();
+    if (code != 200) {
+      Serial.printf("Public IP: HTTP GET %s failed code=%d\n", httpUrls[i], code);
+      http.end();
+      continue;
+    }
+    String ip = http.getString();
+    http.end();
+    ip.trim();
+    if (ip.length() > 0) {
+      Serial.printf("Public IP fetched via HTTP %s: %s\n", httpUrls[i], ip.c_str());
+      return ip;
+    }
+    Serial.printf("Public IP: empty HTTP response from %s\n", httpUrls[i]);
+  }
+
+  return "";
+}
+
+void pushTelemetryToCrm() {
+  if (config.crmUrl[0] == '\0' || config.crmApiKey[0] == '\0') return;
+  if (!ensureMqttConnected()) return;
+
+  unsigned long now = millis();
+  if (lastKnownPublicIp.length() == 0 || now - lastPublicIpFetchMs >= PUBLIC_IP_REFRESH_MS) {
+    String ip = fetchPublicIp();
+    lastPublicIpFetchMs = now; // Başarısız olsa bile 10 dk bekleyerek serial spam'i engelle.
+    if (ip.length() > 0) {
+      lastKnownPublicIp = ip;
+    } else {
+      Serial.println("Public IP fetch failed; telemetry will be sent without publicIp");
+    }
+  }
+
+  String body = buildStatusJsonString();
+  bool ok = mqttClient.publish(mqttTelemetryTopic.c_str(), body.c_str());
+  if (ok) {
+    Serial.println("MQTT telemetry publish OK");
+  } else {
+    Serial.printf(
+      "MQTT telemetry publish FAIL (len=%u, connected=%d, state=%d)\n",
+      body.length(),
+      mqttClient.connected() ? 1 : 0,
+      mqttClient.state()
+    );
+  }
+}
+
+bool sendCommandAckToCrm(const String &commandId, const String &status, const String &errorMessage) {
+  if (commandId.length() == 0) return false;
+  if (config.crmUrl[0] == '\0' || config.crmApiKey[0] == '\0') return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!ensureTlsClockReady()) return false;
+
+  String baseUrl = getCrmBaseUrl();
+  if (baseUrl.length() < 10) return false;
+  String url = baseUrl + "/api/bms/commands/ack";
+
+  WiFiClientSecure client;
+  client.setCACert(HTTPS_TLS_ROOT_CA);
+  client.setTimeout(7000);
+
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    Serial.println("CRM ACK: http.begin failed");
+    return false;
+  }
+  http.setConnectTimeout(7000);
+  http.setTimeout(7000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-BMS-API-Key", String(config.crmApiKey));
+
+  DynamicJsonDocument doc(256);
+  doc["id"] = commandId;
+  doc["status"] = status;
+  if (errorMessage.length() > 0) {
+    doc["error"] = errorMessage;
+  }
+  String payload;
+  serializeJson(doc, payload);
+
+  int code = http.POST(payload);
+  if (code >= 200 && code < 300) {
+    Serial.printf("CRM ACK sent id=%s status=%s\n", commandId.c_str(), status.c_str());
+    http.end();
+    return true;
+  }
+
+  Serial.printf("CRM ACK failed id=%s status=%s code=%d\n", commandId.c_str(), status.c_str(), code);
   http.end();
-  delete secClient;
+  return false;
+}
+
+bool enqueueCommandAck(const String &commandId, const String &status, const String &errorMessage) {
+  if (commandId.length() == 0) return false;
+  uint8_t nextTail = (crmAckQueueTail + 1) % CRM_ACK_QUEUE_SIZE;
+  if (nextTail == crmAckQueueHead) {
+    Serial.printf("CRM ACK queue full, dropping id=%s status=%s\n", commandId.c_str(), status.c_str());
+    return false;
+  }
+  crmAckQueue[crmAckQueueTail].id = commandId;
+  crmAckQueue[crmAckQueueTail].status = status;
+  crmAckQueue[crmAckQueueTail].error = errorMessage;
+  crmAckQueueTail = nextTail;
+  return true;
+}
+
+void flushCommandAckQueue() {
+  if (crmAckQueueHead == crmAckQueueTail) return;
+  unsigned long now = millis();
+  if (now - lastAckRetryMs < ACK_RETRY_INTERVAL_MS) return;
+  lastAckRetryMs = now;
+
+  CommandAckItem &item = crmAckQueue[crmAckQueueHead];
+  if (sendCommandAckToCrm(item.id, item.status, item.error)) {
+    item.id = "";
+    item.status = "";
+    item.error = "";
+    crmAckQueueHead = (crmAckQueueHead + 1) % CRM_ACK_QUEUE_SIZE;
+  }
 }
 
 void processCrmCommands() {
   if (crmStartPending) {
     crmStartPending = false;
-    startSequence();
-    Serial.println("CRM: start sequence executed");
+    String ackId = crmStartCmdId;
+    crmStartCmdId = "";
+    bool started = startSequence();
+    if (started) {
+      Serial.println("CRM: start sequence executed");
+    } else {
+      Serial.println("CRM: start sequence skipped (state/signal guard)");
+    }
+    if (ackId.length() > 0) {
+      enqueueCommandAck(ackId, started ? "done" : "failed", started ? "" : "start preconditions not met");
+    }
   }
   if (crmEmergencyPending) {
     crmEmergencyPending = false;
+    String ackId = crmEmergencyCmdId;
+    crmEmergencyCmdId = "";
     triggerEmergencyStop(true);
     Serial.println("CRM: emergency stop executed");
+    if (ackId.length() > 0) {
+      enqueueCommandAck(ackId, "done");
+    }
+  }
+  if (crmBypassPending) {
+    crmBypassPending = false;
+    String ackId = crmBypassCmdId;
+    crmBypassCmdId = "";
+    if (!bmsSignalActive || config.bypassEnabled) {
+      config.bypassEnabled = !config.bypassEnabled;
+      saveConfig();
+      if (config.bypassEnabled) {
+        currentState = BYPASS_MODE;
+        Serial.println("CRM: bypass mode enabled (MQTT)");
+      } else {
+        currentState = IDLE;
+        setAllOutputsOff();
+        Serial.println("CRM: bypass mode disabled (MQTT)");
+      }
+      if (ackId.length() > 0) {
+        enqueueCommandAck(ackId, "done");
+      }
+    } else {
+      Serial.println("CRM: bypass command ignored (BMS signal required)");
+      if (ackId.length() > 0) {
+        enqueueCommandAck(ackId, "failed", "bms signal required");
+      }
+    }
   }
   while (crmButtonQueueHead != crmButtonQueueTail) {
+    String ackId = crmButtonCmdIdQueue[crmButtonQueueHead];
+    crmButtonCmdIdQueue[crmButtonQueueHead] = "";
     unsigned long dur = crmButtonQueue[crmButtonQueueHead];
     crmButtonQueueHead = (crmButtonQueueHead + 1) % CRM_BUTTON_QUEUE_SIZE;
     triggerVirtualButtonPress(dur);
     Serial.printf("CRM: button press executed (%lu ms)\n", dur);
+    if (ackId.length() > 0) {
+      enqueueCommandAck(ackId, "done");
+    }
   }
 }
 
@@ -1757,10 +2229,6 @@ String getOtaGithubToken() {
 
 bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, const String &assetLabel, bool restartAfter) {
   String otaToken = getOtaGithubToken();
-  if (otaToken.length() == 0) {
-    Serial.println("OTA: GitHub token is empty");
-    return false;
-  }
 
   HTTPClient http;
   WiFiClientSecure *secClient = new WiFiClientSecure;
@@ -1769,13 +2237,19 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
     return false;
   }
 
-  secClient->setInsecure();
+  if (!ensureTlsClockReady()) {
+    delete secClient;
+    return false;
+  }
+  secClient->setCACert(HTTPS_TLS_ROOT_CA);
   secClient->setHandshakeTimeout(30);
   http.begin(*secClient, assetApiUrl);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setRedirectLimit(5);
   http.setTimeout(30000);
-  http.addHeader("Authorization", String("Bearer ") + otaToken);
+  if (otaToken.length() > 0) {
+    http.addHeader("Authorization", String("Bearer ") + otaToken);
+  }
   http.addHeader("User-Agent", "Nama-BMS-ESP32");
   http.addHeader("Accept", "application/vnd.github.raw");
 
@@ -1855,22 +2329,27 @@ bool downloadAndApplyOtaAsset(const String &assetApiUrl, int updateCommand, cons
 
 void checkForOtaUpdate() {
   if (WiFi.status() != WL_CONNECTED) return;
-  String otaToken = getOtaGithubToken();
-  if (otaToken.length() == 0) return;
 
+  String otaToken = getOtaGithubToken();
   String manifestUrl = String("https://api.github.com/repos/") + OTA_GITHUB_OWNER + "/" + OTA_GITHUB_REPO + "/contents/" + OTA_MANIFEST_PATH + "?ref=main";
 
   HTTPClient http;
   WiFiClientSecure *secClient = new WiFiClientSecure;
   if (!secClient) return;
 
-  secClient->setInsecure();
+  if (!ensureTlsClockReady()) {
+    delete secClient;
+    return;
+  }
+  secClient->setCACert(HTTPS_TLS_ROOT_CA);
   secClient->setHandshakeTimeout(30);
   http.begin(*secClient, manifestUrl);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setRedirectLimit(5);
   http.setTimeout(8000);
-  http.addHeader("Authorization", String("Bearer ") + otaToken);
+  if (otaToken.length() > 0) {
+    http.addHeader("Authorization", String("Bearer ") + otaToken);
+  }
   http.addHeader("User-Agent", "Nama-BMS-ESP32");
   http.addHeader("Accept", "application/vnd.github.raw");
 
@@ -1988,9 +2467,8 @@ void crmTask(void *param) {
       pushTelemetryToCrm();
     }
 
-    // Beklenmedik restart olmamasi icin OTA sadece manuel tetikleme ile calissin.
-    // Manuel tetikleme: /api/ota-check
-    if (otaCheckPending) {
+    // OTA otomatik kontrolü yap; gerekirse /api/ota-check ile manuel de tetiklenebilir.
+    if (otaCheckPending || now - lastOtaCheck >= OTA_CHECK_INTERVAL_MS) {
       lastOtaCheck = now;
       otaCheckPending = false;
       checkForOtaUpdate();
@@ -2000,80 +2478,7 @@ void crmTask(void *param) {
 
 void pollCommandsFromCrm() {
   if (config.crmUrl[0] == '\0' || config.crmApiKey[0] == '\0') return;
-  String baseUrl = getCrmBaseUrl();
-  if (baseUrl.length() < 10) return;
-
-  String mac = (WiFi.status() == WL_CONNECTED) ? WiFi.macAddress() : WiFi.softAPmacAddress();
-  String url = baseUrl + "/api/bms/commands?mac=" + mac;
-
-  HTTPClient http;
-  WiFiClientSecure *secClient = nullptr;
-
-  if (baseUrl.startsWith("https://")) {
-    secClient = new WiFiClientSecure;
-    if (!secClient) return;
-    secClient->setInsecure();
-    secClient->setHandshakeTimeout(30);
-    http.begin(*secClient, url);
-  } else {
-    http.begin(url);
-  }
-
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.setRedirectLimit(5);
-  http.addHeader("X-BMS-API-Key", config.crmApiKey);
-  http.setTimeout(700);
-
-  int httpCode = http.GET();
-
-  if (httpCode == 200) {
-    String responseBody = http.getString();
-
-    DynamicJsonDocument doc(2048);
-    if (deserializeJson(doc, responseBody) == DeserializationError::Ok) {
-      JsonArray arr = doc["commands"].as<JsonArray>();
-      if (!arr.isNull()) {
-        for (JsonObject cmd : arr) {
-          const char *type = cmd["commandType"];
-          if (!type) continue;
-          if (strcmp(type, "start") == 0) {
-            crmStartPending = true;
-          } else if (strcmp(type, "emergency") == 0) {
-            crmEmergencyPending = true;
-          } else if (strcmp(type, "button") == 0) {
-            JsonObject pl = cmd["payload"].as<JsonObject>();
-            unsigned long dur = pl["durationMs"] | 120UL;
-            enqueueCrmButton(dur);
-          } else if (strcmp(type, "config") == 0) {
-            JsonObject pl = cmd["payload"].as<JsonObject>();
-            if (!pl.isNull()) {
-              if (pl.containsKey("batteryType")) config.batteryType = pl["batteryType"] | config.batteryType;
-              if (pl.containsKey("seriesCount")) config.seriesCount = pl["seriesCount"] | config.seriesCount;
-              if (pl.containsKey("cellCapacity")) config.cellCapacity = pl["cellCapacity"] | config.cellCapacity;
-              if (pl.containsKey("maxChargeCurrent")) config.maxChargeCurrent = pl["maxChargeCurrent"] | config.maxChargeCurrent;
-              if (pl.containsKey("maxDischargeCurrent")) config.maxDischargeCurrent = pl["maxDischargeCurrent"] | config.maxDischargeCurrent;
-              if (pl.containsKey("prechargeTime")) config.prechargeTime = pl["prechargeTime"] | config.prechargeTime;
-              if (pl.containsKey("mosfetOnTime")) config.mosfetOnTime = pl["mosfetOnTime"] | config.mosfetOnTime;
-              if (pl.containsKey("shortCircuitThreshold")) config.shortCircuitThreshold = pl["shortCircuitThreshold"] | config.shortCircuitThreshold;
-              if (pl.containsKey("sensor1Calibration")) config.sensor1Calibration = pl["sensor1Calibration"] | config.sensor1Calibration;
-              if (pl.containsKey("sensor2Calibration")) config.sensor2Calibration = pl["sensor2Calibration"] | config.sensor2Calibration;
-              saveConfig();
-            }
-          }
-        }
-      }
-    }
-  } else if (httpCode > 0) {
-    Serial.printf("CRM poll HTTP %d\n", httpCode);
-  } else {
-    static unsigned long lastPollErrLog = 0;
-    if (millis() - lastPollErrLog > 15000) {
-      lastPollErrLog = millis();
-      Serial.printf("CRM poll FAIL: %s -> %s\n", http.errorToString(httpCode).c_str(), url.c_str());
-    }
-  }
-
-  http.end();
-  if (secClient) delete secClient;
+  if (!ensureMqttConnected()) return;
+  mqttClient.loop();
 }
 
